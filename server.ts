@@ -5,29 +5,17 @@ import { z } from "zod";
 import { readFileSync } from "node:fs";
 import { parse } from "csv-parse/sync";
 
-/**
- * ---------------------------
- * Helpers: parsing & normalize
- * ---------------------------
- */
-const toNum = (v?: string) => {
-  if (v == null || v === "") return null;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-};
-const toPct = (v?: string) => {
-  if (v == null || v === "") return null;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-};
+/** Helpers */
+const toNum = (v?: string) =>
+  v == null || v === "" ? null : Number.isFinite(Number(v)) ? Number(v) : null;
+const toPct = (v?: string) =>
+  v == null || v === "" ? null : Number.isFinite(Number(v)) ? Number(v) : null;
 const cleanPlayer = (raw?: string) => {
   const s = (raw ?? "").trim();
   const bats = s.includes("*") ? "L" : s.includes("#") ? "S" : null;
   const name = s.replace("*", "").replace("#", "").trim();
   return { name, bats };
 };
-
-// Baseball IP like 168.2 means 168 and 2 outs (2/3 inning).
 function ipToOuts(ipStr?: string): number | null {
   if (!ipStr) return null;
   const n = Number(ipStr);
@@ -40,12 +28,7 @@ function ipToOuts(ipStr?: string): number | null {
 const outsToInningsFloat = (outs: number | null) =>
   outs == null ? null : +(outs / 3).toFixed(3);
 
-/**
- * ---------------------------
- * Batting loader (your headers)
- * ---------------------------
- * Rk,Player,Age,Pos,WAR,G,PA,AB,R,H,2B,3B,HR,RBI,SB,CS,BB,SO,BA,OBP,SLG,OPS,OPS+,rOBA,Rbat+,TB,GIDP,HBP,SH,SF,IBB,Pos,Awards,Player-additional
- */
+/** Batting loader */
 type BattingRow = {
   rk: number | null;
   player_raw: string;
@@ -71,9 +54,9 @@ type BattingRow = {
   obp: number | null;
   slg: number | null;
   ops: number | null;
-  ops_plus: number | null; // OPS+
-  roba: number | null; // your column is rOBA (keep as-is)
-  rbat_plus: number | null; // Rbat+
+  ops_plus: number | null;
+  roba: number | null;
+  rbat_plus: number | null;
   tb: number | null;
   gidp: number | null;
   hbp: number | null;
@@ -81,9 +64,8 @@ type BattingRow = {
   sf: number | null;
   ibb: number | null;
   awards: string | null;
-  player_id: string | null; // Player-additional
+  player_id: string | null;
 };
-
 const battingKeyMap: Record<string, string> = {
   Rk: "rk",
   Player: "player_raw",
@@ -119,7 +101,6 @@ const battingKeyMap: Record<string, string> = {
   Awards: "awards",
   "Player-additional": "player_id",
 };
-
 function loadBattingCSV(path: string): BattingRow[] {
   const csv = readFileSync(path, "utf8");
   const rows: Record<string, string>[] = parse(csv, {
@@ -128,18 +109,11 @@ function loadBattingCSV(path: string): BattingRow[] {
     relax_column_count: true,
     trim: true,
   });
-
   const out: BattingRow[] = [];
   for (const r of rows) {
     const m: Record<string, string> = {};
-    for (const [k, v] of Object.entries(r)) {
-      m[battingKeyMap[k] ?? k] = v;
-    }
-    const isTeam = (m["player_raw"] ?? "")
-      .toLowerCase()
-      .includes("team totals");
-    if (isTeam) continue;
-
+    for (const [k, v] of Object.entries(r)) m[battingKeyMap[k] ?? k] = v;
+    if ((m["player_raw"] ?? "").toLowerCase().includes("team totals")) continue;
     const { name, bats } = cleanPlayer(m["player_raw"]);
     out.push({
       rk: toNum(m["rk"]),
@@ -183,12 +157,7 @@ function loadBattingCSV(path: string): BattingRow[] {
   return out;
 }
 
-/**
- * ----------------------------
- * Pitching loader (your headers)
- * ----------------------------
- * Rk,Player,Age,Pos,WAR,W,L,W-L%,ERA,G,GS,GF,CG,SHO,SV,IP,H,R,ER,HR,BB,IBB,SO,HBP,BK,WP,BF,ERA+,FIP,WHIP,H9,HR9,BB9,SO9,SO/BB,Awards,Player-additional
- */
+/** Pitching loader */
 type PitchingRow = {
   rk: number | null;
   player_raw: string;
@@ -207,8 +176,8 @@ type PitchingRow = {
   cg: number | null;
   sho: number | null;
   sv: number | null;
-  ip_outs: number | null; // canonical
-  ip: number | null; // float
+  ip_outs: number | null;
+  ip: number | null;
   h: number | null;
   r: number | null;
   er: number | null;
@@ -231,7 +200,6 @@ type PitchingRow = {
   awards: string | null;
   player_id: string | null;
 };
-
 const pitchingKeyMap: Record<string, string> = {
   Rk: "rk",
   Player: "player_raw",
@@ -271,7 +239,6 @@ const pitchingKeyMap: Record<string, string> = {
   Awards: "awards",
   "Player-additional": "player_id",
 };
-
 function loadPitchingCSV(path: string): PitchingRow[] {
   const csv = readFileSync(path, "utf8");
   const rows: Record<string, string>[] = parse(csv, {
@@ -280,22 +247,14 @@ function loadPitchingCSV(path: string): PitchingRow[] {
     relax_column_count: true,
     trim: true,
   });
-
   const out: PitchingRow[] = [];
   for (const r of rows) {
     const m: Record<string, string> = {};
-    for (const [k, v] of Object.entries(r)) {
-      m[pitchingKeyMap[k] ?? k] = v;
-    }
-    const isTeam = (m["player_raw"] ?? "")
-      .toLowerCase()
-      .includes("team totals");
-    if (isTeam) continue;
-
+    for (const [k, v] of Object.entries(r)) m[pitchingKeyMap[k] ?? k] = v;
+    if ((m["player_raw"] ?? "").toLowerCase().includes("team totals")) continue;
     const { name, bats } = cleanPlayer(m["player_raw"]);
     const ip_outs = ipToOuts(m["ip_csv"]);
     const ip = outsToInningsFloat(ip_outs);
-
     out.push({
       rk: toNum(m["rk"]),
       player_raw: m["player_raw"] ?? "",
@@ -343,17 +302,11 @@ function loadPitchingCSV(path: string): PitchingRow[] {
   return out;
 }
 
-/**
- * ---------------------------
- * Load both CSVs (normalized)
- * ---------------------------
- */
+/** Load data */
 const batting = loadBattingCSV("./batting_2025_mets.csv");
 const pitching = loadPitchingCSV("./pitching_2025_mets.csv");
 
-/**
- * Metric/column aliases so your tools accept either original or normalized names.
- */
+/** Metric aliases */
 const metricAliases: Record<string, string> = {
   // batting
   "OPS+": "ops_plus",
@@ -394,42 +347,33 @@ const metricAliases: Record<string, string> = {
   ERA: "era",
   BF: "bf",
 };
-
 const normalizeMetric = (m: string) =>
   metricAliases[m] ?? metricAliases[m.toUpperCase()] ?? m;
 const normalizeColumns = (cols: string[]) =>
   cols.map((c) => normalizeMetric(c));
 
-/**
- * ---------------------------
- * MCP Server + Tools
- * ---------------------------
- */
+/** MCP server + tools */
 const server = new McpServer({ name: "mets-2025", version: "0.1.0" });
 
-// Tool 1: single-player snapshot (batting or pitching)
+// Tool: single-player snapshot
 server.registerTool(
   "get_player_stats",
   {
-    title: "Get player stats",
     description:
       "Return a subset of batting or pitching columns for one player",
     inputSchema: {
       table: z.enum(["batting", "pitching"]),
       player: z.string(),
       columns: z.array(z.string()).min(1),
-      filters: z.record(z.string(), z.string()).optional(), // keep for future use
+      filters: z.record(z.string(), z.string()).optional(),
     },
-    outputSchema: z.object({ rows: z.array(z.record(z.string(), z.any())) }),
   },
   async ({ table, player, columns, filters }) => {
     const data = table === "batting" ? batting : pitching;
     const cols = normalizeColumns(columns);
     const rows = data
       .filter(
-        (r: any) =>
-          (r.player_name ?? r.Player ?? "").toLowerCase() ===
-          player.toLowerCase()
+        (r: any) => (r.player_name ?? "").toLowerCase() === player.toLowerCase()
       )
       .filter(
         (r: any) =>
@@ -445,11 +389,10 @@ server.registerTool(
   }
 );
 
-// Tool 2: simple leaderboard
+// Tool: leaderboard
 server.registerTool(
   "leaderboard",
   {
-    title: "Leaderboard",
     description: "Top-N by a metric with optional qualifier",
     inputSchema: {
       table: z.enum(["batting", "pitching"]),
@@ -460,13 +403,11 @@ server.registerTool(
         .object({ minPA: z.number().optional(), minIP: z.number().optional() })
         .optional(),
     },
-    outputSchema: z.object({ rows: z.array(z.record(z.string(), z.any())) }),
   },
   async ({ table, metric, direction, limit, qualifier }) => {
     const key = normalizeMetric(metric);
     const dataRaw = table === "batting" ? batting : pitching;
 
-    // qualifiers: PA for batters, IP (float) for pitchers
     const data = dataRaw.filter((r: any) => {
       if (table === "batting" && qualifier?.minPA)
         return (r.pa ?? 0) >= qualifier.minPA;
@@ -501,10 +442,45 @@ server.registerTool(
   }
 );
 
-// Minimal Streamable HTTP wiring
+/** Express wiring (order matters) */
 const app = express();
 app.use(express.json());
+
+// CORS / preflight
+app.options("/mcp", (req, res) => {
+  res.set({
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Methods": "POST, OPTIONS, GET",
+  });
+  res.sendStatus(204);
+});
+
+// Health check (GET /mcp)
+app.get("/mcp", (req, res) => {
+  res.set({ "Access-Control-Allow-Origin": "*" });
+  res
+    .status(200)
+    .json({ ok: true, server: "mets-2025", transport: "streamable-http" });
+});
+
+// Accept header patch before POST
+app.use("/mcp", (req, _res, next) => {
+  const acc = String(req.headers["accept"] || "");
+  const hasJSON = acc.includes("application/json");
+  const hasSSE = acc.includes("text/event-stream");
+  if (!hasJSON || !hasSSE)
+    req.headers["accept"] = "application/json, text/event-stream";
+  next();
+});
+
+// Single POST handler
 app.post("/mcp", async (req, res) => {
+  res.set({
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  });
+
   const transport = new StreamableHTTPServerTransport({
     enableJsonResponse: true,
   });
@@ -512,4 +488,5 @@ app.post("/mcp", async (req, res) => {
   await server.connect(transport);
   await transport.handleRequest(req, res, req.body);
 });
+
 app.listen(3000, () => console.log("MCP at http://localhost:3000/mcp"));
