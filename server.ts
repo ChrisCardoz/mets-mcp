@@ -2,7 +2,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express from "express";
 import { z } from "zod";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync, statSync, existsSync } from "node:fs";
+import { join } from "node:path";
 import { parse } from "csv-parse/sync";
 
 /** Helpers */
@@ -302,9 +303,84 @@ function loadPitchingCSV(path: string): PitchingRow[] {
   return out;
 }
 
-/** Load data */
-const batting = loadBattingCSV("./batting_2025_mets.csv");
-const pitching = loadPitchingCSV("./pitching_2025_mets.csv");
+/** Load data (multi-team, 2025) */
+const TEAMS = [
+  "ARI",
+  "ATL",
+  "BAL",
+  "BOS",
+  "CHC",
+  "CIN",
+  "CLE",
+  "COL",
+  "CWS",
+  "DET",
+  "HOU",
+  "KC",
+  "LAA",
+  "LAD",
+  "MIA",
+  "MIL",
+  "MIN",
+  "NYM",
+  "NYY",
+  "OAK",
+  "PHI",
+  "PIT",
+  "SD",
+  "SEA",
+  "SF",
+  "STL",
+  "TB",
+  "TEX",
+  "TOR",
+  "WSH",
+] as const;
+type TeamCode = (typeof TEAMS)[number];
+
+type BattingWithTeam = BattingRow & { team: TeamCode };
+type PitchingWithTeam = PitchingRow & { team: TeamCode };
+
+const battingByTeam: Record<string, BattingWithTeam[]> = {};
+const pitchingByTeam: Record<string, PitchingWithTeam[]> = {};
+
+function loadSeasonTeams(season: string) {
+  const base = join("data", season);
+  if (!existsSync(base)) return;
+  for (const entry of readdirSync(base)) {
+    const teamDir = join(base, entry);
+    let isDir = false;
+    try {
+      isDir = statSync(teamDir).isDirectory();
+    } catch {
+      isDir = false;
+    }
+    if (!isDir) continue;
+
+    const team = entry.toUpperCase() as TeamCode;
+
+    try {
+      const b = loadBattingCSV(join(teamDir, "batting.csv")).map(
+        (r) => ({ ...(r as BattingRow), team })
+      );
+      battingByTeam[team] = b;
+    } catch {
+      // ignore missing batting.csv for team
+    }
+
+    try {
+      const p = loadPitchingCSV(join(teamDir, "pitching.csv")).map(
+        (r) => ({ ...(r as PitchingRow), team })
+      );
+      pitchingByTeam[team] = p;
+    } catch {
+      // ignore missing pitching.csv for team
+    }
+  }
+}
+
+// Initialize by scanning data/2025/*
+loadSeasonTeams("2025");
 
 /** Metric aliases */
 const metricAliases: Record<string, string> = {
@@ -353,7 +429,7 @@ const normalizeColumns = (cols: string[]) =>
   cols.map((c) => normalizeMetric(c));
 
 /** MCP server + tools */
-const server = new McpServer({ name: "mets-2025", version: "0.1.0" });
+const server = new McpServer({ name: "mlb-2025", version: "0.2.0" });
 
 // Tool: single-player snapshot
 server.registerTool(
@@ -363,13 +439,19 @@ server.registerTool(
       "Return a subset of batting or pitching columns for one player",
     inputSchema: {
       table: z.enum(["batting", "pitching"]),
+      scope: z.enum(["team", "league"]).default("team"),
+      team: z.string().length(3).default("NYM"),
       player: z.string(),
       columns: z.array(z.string()).min(1),
       filters: z.record(z.string(), z.string()).optional(),
     },
   },
-  async ({ table, player, columns, filters }) => {
-    const data = table === "batting" ? batting : pitching;
+  async ({ table, scope, team, player, columns, filters }) => {
+    const dataMap = table === "batting" ? battingByTeam : pitchingByTeam;
+    const data =
+      scope === "league"
+        ? Object.values(dataMap).flat()
+        : dataMap[String(team).toUpperCase()] ?? [];
     const cols = normalizeColumns(columns);
     const rows = data
       .filter(
@@ -380,7 +462,10 @@ server.registerTool(
           !filters ||
           Object.entries(filters).every(([k, v]) => String(r[k]) === v)
       )
-      .map((r: any) => Object.fromEntries(cols.map((c) => [c, r[c]])));
+      .map((r: any) => {
+        const base = Object.fromEntries(cols.map((c) => [c, r[c]]));
+        return scope === "league" ? { team: r.team, ...base } : base;
+      });
     const output = { rows };
     return {
       content: [{ type: "text", text: JSON.stringify(output) }],
@@ -396,6 +481,8 @@ server.registerTool(
     description: "Top-N by a metric with optional qualifier",
     inputSchema: {
       table: z.enum(["batting", "pitching"]),
+      team: z.string().length(3).default("NYM"),
+      scope: z.enum(["team", "league"]).default("team"),
       metric: z.string(), // e.g., "OPS+", "ops_plus", "FIP", "SO/BB"
       direction: z.enum(["asc", "desc"]),
       limit: z.number().min(1).max(25),
@@ -404,9 +491,13 @@ server.registerTool(
         .optional(),
     },
   },
-  async ({ table, metric, direction, limit, qualifier }) => {
+  async ({ table, team, scope, metric, direction, limit, qualifier }) => {
     const key = normalizeMetric(metric);
-    const dataRaw = table === "batting" ? batting : pitching;
+    const map = table === "batting" ? battingByTeam : pitchingByTeam;
+    const dataRaw =
+      scope === "league"
+        ? Object.values(map).flat()
+        : map[String(team).toUpperCase()] ?? [];
 
     const data = dataRaw.filter((r: any) => {
       if (table === "batting" && qualifier?.minPA)
@@ -429,12 +520,33 @@ server.registerTool(
       });
 
     const rows = sorted.slice(0, limit).map((r: any) => ({
+      team: r.team,
       player: r.player_name,
       [key]: r[key],
       ...(table === "batting" ? { PA: r.pa } : { IP: r.ip }),
     }));
 
     const output = { rows };
+    return {
+      content: [{ type: "text", text: JSON.stringify(output) }],
+      structuredContent: output,
+    };
+  }
+);
+
+// Tool: teams listing
+server.registerTool(
+  "teams",
+  {
+    description: "List teams discovered under data/2025",
+    inputSchema: {},
+  },
+  async () => {
+    const uniq = new Set<string>();
+    Object.keys(battingByTeam).forEach((t) => uniq.add(t));
+    Object.keys(pitchingByTeam).forEach((t) => uniq.add(t));
+    const teams = Array.from(uniq).sort();
+    const output = { teams };
     return {
       content: [{ type: "text", text: JSON.stringify(output) }],
       structuredContent: output,
@@ -461,7 +573,7 @@ app.get("/mcp", (req, res) => {
   res.set({ "Access-Control-Allow-Origin": "*" });
   res
     .status(200)
-    .json({ ok: true, server: "mets-2025", transport: "streamable-http" });
+    .json({ ok: true, server: "mlb-2025", transport: "streamable-http" });
 });
 
 // Accept header patch before POST
