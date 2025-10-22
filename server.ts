@@ -428,8 +428,82 @@ const normalizeMetric = (m: string) =>
 const normalizeColumns = (cols: string[]) =>
   cols.map((c) => normalizeMetric(c));
 
+// --- Position helpers (batting) ---
+const POS_MAP: Record<string, string> = {
+  "1": "P",
+  "2": "C",
+  "3": "1B",
+  "4": "2B",
+  "5": "3B",
+  "6": "SS",
+  "7": "LF",
+  "8": "CF",
+  "9": "RF",
+  D: "DH",
+};
+function extractPositions(posRaw?: string | null): string[] {
+  if (!posRaw) return [];
+  // Example inputs: "*4/DH3", "5H/46D", "/473DH9", "UT"
+  const rawU = (posRaw || "").toUpperCase();
+  const tokens = rawU.replace(/\*/g, "").split(/[\/]/).filter(Boolean);
+  const out = new Set<string>();
+  if (rawU.includes("UT")) out.add("UT");
+  for (const t of tokens) {
+    for (const ch of t) {
+      const mapped = POS_MAP[ch];
+      if (mapped) out.add(mapped);
+    }
+  }
+  return Array.from(out);
+}
+function normalizePositionQuery(
+  q?: string | null
+): { targets: Set<string>; isOutfield: boolean; isUtility: boolean } {
+  if (!q) return { targets: new Set(), isOutfield: false };
+  const s = q.trim().toLowerCase();
+  const map: Record<string, string> = {
+    "c": "C",
+    "catcher": "C",
+    "1b": "1B",
+    "first": "1B",
+    "first base": "1B",
+    "2b": "2B",
+    "second": "2B",
+    "second base": "2B",
+    "3b": "3B",
+    "third": "3B",
+    "third base": "3B",
+    "ss": "SS",
+    "short": "SS",
+    "shortstop": "SS",
+    "lf": "LF",
+    "left": "LF",
+    "left field": "LF",
+    "cf": "CF",
+    "center": "CF",
+    "center field": "CF",
+    "rf": "RF",
+    "right": "RF",
+    "right field": "RF",
+    "of": "OF",
+    "outfield": "OF",
+    "if": "INF",
+    "inf": "INF",
+    "infield": "INF",
+    "dh": "DH",
+    "designated hitter": "DH",
+    "ut": "UT",
+    "utility": "UT",
+  };
+  const lookup = map[s] || map[s.replace(/\s+/g, " ")] || map[s.replace(/\s+/g, "")] || s.toUpperCase();
+  if (lookup === "OF") return { targets: new Set(["LF", "CF", "RF"]), isOutfield: true, isUtility: false };
+  if (lookup === "INF") return { targets: new Set(["1B", "2B", "3B", "SS"]), isOutfield: false, isUtility: false };
+  if (lookup === "UT") return { targets: new Set(["UT"]), isOutfield: false, isUtility: true };
+  return { targets: new Set([lookup]), isOutfield: false, isUtility: false };
+}
+
 /** MCP server + tools */
-const server = new McpServer({ name: "mlb-2025", version: "0.2.0" });
+const server = new McpServer({ name: "mlb-2025", version: "0.3.0" });
 
 // Tool: single-player snapshot
 server.registerTool(
@@ -489,9 +563,11 @@ server.registerTool(
       qualifier: z
         .object({ minPA: z.number().optional(), minIP: z.number().optional() })
         .optional(),
+      // New: optional position filter (batting only). Accepts aliases like "2B", "second base", "OF".
+      position: z.string().optional(),
     },
   },
-  async ({ table, team, scope, metric, direction, limit, qualifier }) => {
+  async ({ table, team, scope, metric, direction, limit, qualifier, position }) => {
     const key = normalizeMetric(metric);
     const map = table === "batting" ? battingByTeam : pitchingByTeam;
     const dataRaw =
@@ -499,13 +575,29 @@ server.registerTool(
         ? Object.values(map).flat()
         : map[String(team).toUpperCase()] ?? [];
 
-    const data = dataRaw.filter((r: any) => {
+    const dataPre = dataRaw.filter((r: any) => {
       if (table === "batting" && qualifier?.minPA)
         return (r.pa ?? 0) >= qualifier.minPA;
       if (table === "pitching" && qualifier?.minIP)
         return (r.ip ?? 0) >= qualifier.minIP;
       return true;
     });
+
+    // Optional: filter by position for batting
+    const data =
+      table === "batting" && position
+        ? dataPre.filter((r: any) => {
+            const { targets, isUtility } = normalizePositionQuery(position);
+            const posList = extractPositions(r.pos_raw);
+            if (isUtility) {
+              const isUT = String(r.pos_raw || "").toUpperCase().includes("UT") || posList.length >= 2;
+              return isUT;
+            }
+            if (targets.size === 0) return true;
+            if (!posList.length) return false;
+            return posList.some((p) => targets.has(p));
+          })
+        : dataPre;
 
     const sorted = data
       .filter((r: any) => r[key] != null)
@@ -524,6 +616,7 @@ server.registerTool(
       player: r.player_name,
       [key]: r[key],
       ...(table === "batting" ? { PA: r.pa } : { IP: r.ip }),
+      ...(table === "batting" ? { pos: extractPositions(r.pos_raw).join("/") } : {}),
     }));
 
     const output = { rows };
