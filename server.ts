@@ -390,6 +390,21 @@ const metricAliases: Record<string, string> = {
   OPS_plus: "ops_plus",
   OPS: "ops",
   ops: "ops",
+  // Map unavailable FanGraphs-style metrics to available equivalents
+  // Note: these are proxies, not identical formulas.
+  "wRC+": "rbat_plus",
+  "WRC+": "rbat_plus",
+  "wrc+": "rbat_plus",
+  fWAR: "war",
+  FWAR: "war",
+  fwar: "war",
+  // WAR synonyms and natural language intents
+  WAR: "war",
+  war: "war",
+  "wins above replacement": "war",
+  "the best": "war",
+  best: "war",
+  "most valuable": "war",
   BA: "ba",
   OBP: "obp",
   SLG: "slg",
@@ -406,6 +421,9 @@ const metricAliases: Record<string, string> = {
   "W-L%": "wl_pct",
   "w-l%": "wl_pct",
   "wl%": "wl_pct",
+  // Map unavailable FanGraphs-style ERA- to ERA+ as a rough substitute
+  "ERA-": "era_plus",
+  "era-": "era_plus",
   "ERA+": "era_plus",
   "era+": "era_plus",
   "SO/BB": "so_per_bb",
@@ -423,10 +441,37 @@ const metricAliases: Record<string, string> = {
   ERA: "era",
   BF: "bf",
 };
-const normalizeMetric = (m: string) =>
-  metricAliases[m] ?? metricAliases[m.toUpperCase()] ?? m;
-const normalizeColumns = (cols: string[]) =>
-  cols.map((c) => normalizeMetric(c));
+// Natural-language phrases we intentionally interpret as WAR
+const NATURAL_LANGUAGE_ALIASES = new Set<string>([
+  "the best",
+  "best",
+  "most valuable",
+  "wins above replacement",
+]);
+
+type NormalizedMetric = { key: string; note?: string };
+const normalizeMetricDetailed = (m: string): NormalizedMetric => {
+  const raw = String(m ?? "");
+  const key = metricAliases[raw] ?? metricAliases[raw.toUpperCase()] ?? raw;
+  const isNatural = NATURAL_LANGUAGE_ALIASES.has(raw.trim().toLowerCase());
+  return isNatural && key !== raw
+    ? { key, note: `interpreted '${raw}' as '${key.toUpperCase() === key ? key : key}'` }
+    : { key };
+};
+
+const normalizeMetric = (m: string) => normalizeMetricDetailed(m).key;
+const normalizeColumns = (cols: string[]) => cols.map((c) => normalizeMetric(c));
+
+const normalizeColumnsWithNotes = (cols: string[]) => {
+  const keys: string[] = [];
+  const notes: string[] = [];
+  for (const c of cols) {
+    const { key, note } = normalizeMetricDetailed(c);
+    keys.push(key);
+    if (note) notes.push(note);
+  }
+  return { keys, notes };
+};
 
 // --- Position helpers (batting) ---
 const POS_MAP: Record<string, string> = {
@@ -493,7 +538,11 @@ function normalizePositionQuery(
     "dh": "DH",
     "designated hitter": "DH",
     "ut": "UT",
+    "util": "UT",
     "utility": "UT",
+    "utility player": "UT",
+    "utility players": "UT",
+    "utility infielder": "INF",
   };
   const lookup = map[s] || map[s.replace(/\s+/g, " ")] || map[s.replace(/\s+/g, "")] || s.toUpperCase();
   if (lookup === "OF") return { targets: new Set(["LF", "CF", "RF"]), isOutfield: true, isUtility: false };
@@ -510,7 +559,7 @@ server.registerTool(
   "get_player_stats",
   {
     description:
-      "Return a subset of batting or pitching columns for one player",
+      "Return a subset of batting or pitching columns for one player (MLB 2025 dataset)",
     inputSchema: {
       table: z.enum(["batting", "pitching"]),
       scope: z.enum(["team", "league"]).default("team"),
@@ -526,7 +575,7 @@ server.registerTool(
       scope === "league"
         ? Object.values(dataMap).flat()
         : dataMap[String(team).toUpperCase()] ?? [];
-    const cols = normalizeColumns(columns);
+    const { keys: cols, notes } = normalizeColumnsWithNotes(columns);
     const rows = data
       .filter(
         (r: any) => (r.player_name ?? "").toLowerCase() === player.toLowerCase()
@@ -540,7 +589,7 @@ server.registerTool(
         const base = Object.fromEntries(cols.map((c) => [c, r[c]]));
         return scope === "league" ? { team: r.team, ...base } : base;
       });
-    const output = { rows };
+    const output = notes.length ? { rows, warnings: Array.from(new Set(notes)) } : { rows };
     return {
       content: [{ type: "text", text: JSON.stringify(output) }],
       structuredContent: output,
@@ -552,11 +601,11 @@ server.registerTool(
 server.registerTool(
   "leaderboard",
   {
-    description: "Top-N by a metric with optional qualifier",
+    description: "Top-N by a metric with optional qualifier (MLB 2025 dataset)",
     inputSchema: {
       table: z.enum(["batting", "pitching"]),
       team: z.string().length(3).default("NYM"),
-      scope: z.enum(["team", "league"]).default("team"),
+      scope: z.enum(["team", "league"]).default("league"),
       metric: z.string(), // e.g., "OPS+", "ops_plus", "FIP", "SO/BB"
       direction: z.enum(["asc", "desc"]),
       limit: z.number().min(1).max(25),
@@ -568,7 +617,7 @@ server.registerTool(
     },
   },
   async ({ table, team, scope, metric, direction, limit, qualifier, position }) => {
-    const key = normalizeMetric(metric);
+    const { key, note } = normalizeMetricDetailed(metric);
     const map = table === "batting" ? battingByTeam : pitchingByTeam;
     const dataRaw =
       scope === "league"
@@ -590,8 +639,12 @@ server.registerTool(
             const { targets, isUtility } = normalizePositionQuery(position);
             const posList = extractPositions(r.pos_raw);
             if (isUtility) {
-              const isUT = String(r.pos_raw || "").toUpperCase().includes("UT") || posList.length >= 2;
-              return isUT;
+              const upper = String(r.pos_raw || "").toUpperCase();
+              const isUT = upper.includes("UT");
+              const infield = new Set(["1B", "2B", "3B", "SS"]);
+              const infieldCount = posList.filter((p) => infield.has(p)).length;
+              const isINFUtility = infieldCount >= 2; // rotational infielder
+              return isUT || isINFUtility;
             }
             if (targets.size === 0) return true;
             if (!posList.length) return false;
@@ -619,7 +672,8 @@ server.registerTool(
       ...(table === "batting" ? { pos: extractPositions(r.pos_raw).join("/") } : {}),
     }));
 
-    const output = { rows };
+    const warnings = note ? [note] : [];
+    const output = warnings.length ? { rows, warnings } : { rows };
     return {
       content: [{ type: "text", text: JSON.stringify(output) }],
       structuredContent: output,
