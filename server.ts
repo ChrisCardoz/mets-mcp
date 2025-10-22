@@ -2,7 +2,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express from "express";
 import { z } from "zod";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync, statSync, existsSync } from "node:fs";
+import { join } from "node:path";
 import { parse } from "csv-parse/sync";
 
 /** Helpers */
@@ -302,9 +303,84 @@ function loadPitchingCSV(path: string): PitchingRow[] {
   return out;
 }
 
-/** Load data */
-const batting = loadBattingCSV("./batting_2025_mets.csv");
-const pitching = loadPitchingCSV("./pitching_2025_mets.csv");
+/** Load data (multi-team, 2025) */
+const TEAMS = [
+  "ARI",
+  "ATL",
+  "BAL",
+  "BOS",
+  "CHC",
+  "CIN",
+  "CLE",
+  "COL",
+  "CWS",
+  "DET",
+  "HOU",
+  "KC",
+  "LAA",
+  "LAD",
+  "MIA",
+  "MIL",
+  "MIN",
+  "NYM",
+  "NYY",
+  "OAK",
+  "PHI",
+  "PIT",
+  "SD",
+  "SEA",
+  "SF",
+  "STL",
+  "TB",
+  "TEX",
+  "TOR",
+  "WSH",
+] as const;
+type TeamCode = (typeof TEAMS)[number];
+
+type BattingWithTeam = BattingRow & { team: TeamCode };
+type PitchingWithTeam = PitchingRow & { team: TeamCode };
+
+const battingByTeam: Record<string, BattingWithTeam[]> = {};
+const pitchingByTeam: Record<string, PitchingWithTeam[]> = {};
+
+function loadSeasonTeams(season: string) {
+  const base = join("data", season);
+  if (!existsSync(base)) return;
+  for (const entry of readdirSync(base)) {
+    const teamDir = join(base, entry);
+    let isDir = false;
+    try {
+      isDir = statSync(teamDir).isDirectory();
+    } catch {
+      isDir = false;
+    }
+    if (!isDir) continue;
+
+    const team = entry.toUpperCase() as TeamCode;
+
+    try {
+      const b = loadBattingCSV(join(teamDir, "batting.csv")).map(
+        (r) => ({ ...(r as BattingRow), team })
+      );
+      battingByTeam[team] = b;
+    } catch {
+      // ignore missing batting.csv for team
+    }
+
+    try {
+      const p = loadPitchingCSV(join(teamDir, "pitching.csv")).map(
+        (r) => ({ ...(r as PitchingRow), team })
+      );
+      pitchingByTeam[team] = p;
+    } catch {
+      // ignore missing pitching.csv for team
+    }
+  }
+}
+
+// Initialize by scanning data/2025/*
+loadSeasonTeams("2025");
 
 /** Metric aliases */
 const metricAliases: Record<string, string> = {
@@ -314,6 +390,21 @@ const metricAliases: Record<string, string> = {
   OPS_plus: "ops_plus",
   OPS: "ops",
   ops: "ops",
+  // Map unavailable FanGraphs-style metrics to available equivalents
+  // Note: these are proxies, not identical formulas.
+  "wRC+": "rbat_plus",
+  "WRC+": "rbat_plus",
+  "wrc+": "rbat_plus",
+  fWAR: "war",
+  FWAR: "war",
+  fwar: "war",
+  // WAR synonyms and natural language intents
+  WAR: "war",
+  war: "war",
+  "wins above replacement": "war",
+  "the best": "war",
+  best: "war",
+  "most valuable": "war",
   BA: "ba",
   OBP: "obp",
   SLG: "slg",
@@ -330,6 +421,9 @@ const metricAliases: Record<string, string> = {
   "W-L%": "wl_pct",
   "w-l%": "wl_pct",
   "wl%": "wl_pct",
+  // Map unavailable FanGraphs-style ERA- to ERA+ as a rough substitute
+  "ERA-": "era_plus",
+  "era-": "era_plus",
   "ERA+": "era_plus",
   "era+": "era_plus",
   "SO/BB": "so_per_bb",
@@ -347,30 +441,141 @@ const metricAliases: Record<string, string> = {
   ERA: "era",
   BF: "bf",
 };
-const normalizeMetric = (m: string) =>
-  metricAliases[m] ?? metricAliases[m.toUpperCase()] ?? m;
-const normalizeColumns = (cols: string[]) =>
-  cols.map((c) => normalizeMetric(c));
+// Natural-language phrases we intentionally interpret as WAR
+const NATURAL_LANGUAGE_ALIASES = new Set<string>([
+  "the best",
+  "best",
+  "most valuable",
+  "wins above replacement",
+]);
+
+type NormalizedMetric = { key: string; note?: string };
+const normalizeMetricDetailed = (m: string): NormalizedMetric => {
+  const raw = String(m ?? "");
+  const key = metricAliases[raw] ?? metricAliases[raw.toUpperCase()] ?? raw;
+  const isNatural = NATURAL_LANGUAGE_ALIASES.has(raw.trim().toLowerCase());
+  return isNatural && key !== raw
+    ? { key, note: `interpreted '${raw}' as '${key.toUpperCase() === key ? key : key}'` }
+    : { key };
+};
+
+const normalizeMetric = (m: string) => normalizeMetricDetailed(m).key;
+const normalizeColumns = (cols: string[]) => cols.map((c) => normalizeMetric(c));
+
+const normalizeColumnsWithNotes = (cols: string[]) => {
+  const keys: string[] = [];
+  const notes: string[] = [];
+  for (const c of cols) {
+    const { key, note } = normalizeMetricDetailed(c);
+    keys.push(key);
+    if (note) notes.push(note);
+  }
+  return { keys, notes };
+};
+
+// --- Position helpers (batting) ---
+const POS_MAP: Record<string, string> = {
+  "1": "P",
+  "2": "C",
+  "3": "1B",
+  "4": "2B",
+  "5": "3B",
+  "6": "SS",
+  "7": "LF",
+  "8": "CF",
+  "9": "RF",
+  D: "DH",
+};
+function extractPositions(posRaw?: string | null): string[] {
+  if (!posRaw) return [];
+  // Example inputs: "*4/DH3", "5H/46D", "/473DH9", "UT"
+  const rawU = (posRaw || "").toUpperCase();
+  const tokens = rawU.replace(/\*/g, "").split(/[\/]/).filter(Boolean);
+  const out = new Set<string>();
+  if (rawU.includes("UT")) out.add("UT");
+  for (const t of tokens) {
+    for (const ch of t) {
+      const mapped = POS_MAP[ch];
+      if (mapped) out.add(mapped);
+    }
+  }
+  return Array.from(out);
+}
+function normalizePositionQuery(
+  q?: string | null
+): { targets: Set<string>; isOutfield: boolean; isUtility: boolean } {
+  if (!q) return { targets: new Set(), isOutfield: false };
+  const s = q.trim().toLowerCase();
+  const map: Record<string, string> = {
+    "c": "C",
+    "catcher": "C",
+    "1b": "1B",
+    "first": "1B",
+    "first base": "1B",
+    "2b": "2B",
+    "second": "2B",
+    "second base": "2B",
+    "3b": "3B",
+    "third": "3B",
+    "third base": "3B",
+    "ss": "SS",
+    "short": "SS",
+    "shortstop": "SS",
+    "lf": "LF",
+    "left": "LF",
+    "left field": "LF",
+    "cf": "CF",
+    "center": "CF",
+    "center field": "CF",
+    "rf": "RF",
+    "right": "RF",
+    "right field": "RF",
+    "of": "OF",
+    "outfield": "OF",
+    "if": "INF",
+    "inf": "INF",
+    "infield": "INF",
+    "dh": "DH",
+    "designated hitter": "DH",
+    "ut": "UT",
+    "util": "UT",
+    "utility": "UT",
+    "utility player": "UT",
+    "utility players": "UT",
+    "utility infielder": "INF",
+  };
+  const lookup = map[s] || map[s.replace(/\s+/g, " ")] || map[s.replace(/\s+/g, "")] || s.toUpperCase();
+  if (lookup === "OF") return { targets: new Set(["LF", "CF", "RF"]), isOutfield: true, isUtility: false };
+  if (lookup === "INF") return { targets: new Set(["1B", "2B", "3B", "SS"]), isOutfield: false, isUtility: false };
+  if (lookup === "UT") return { targets: new Set(["UT"]), isOutfield: false, isUtility: true };
+  return { targets: new Set([lookup]), isOutfield: false, isUtility: false };
+}
 
 /** MCP server + tools */
-const server = new McpServer({ name: "mets-2025", version: "0.1.0" });
+const server = new McpServer({ name: "mlb-2025", version: "0.3.0" });
 
 // Tool: single-player snapshot
 server.registerTool(
   "get_player_stats",
   {
     description:
-      "Return a subset of batting or pitching columns for one player",
+      "Return a subset of batting or pitching columns for one player (MLB 2025 dataset)",
     inputSchema: {
       table: z.enum(["batting", "pitching"]),
+      scope: z.enum(["team", "league"]).default("team"),
+      team: z.string().length(3).default("NYM"),
       player: z.string(),
       columns: z.array(z.string()).min(1),
       filters: z.record(z.string(), z.string()).optional(),
     },
   },
-  async ({ table, player, columns, filters }) => {
-    const data = table === "batting" ? batting : pitching;
-    const cols = normalizeColumns(columns);
+  async ({ table, scope, team, player, columns, filters }) => {
+    const dataMap = table === "batting" ? battingByTeam : pitchingByTeam;
+    const data =
+      scope === "league"
+        ? Object.values(dataMap).flat()
+        : dataMap[String(team).toUpperCase()] ?? [];
+    const { keys: cols, notes } = normalizeColumnsWithNotes(columns);
     const rows = data
       .filter(
         (r: any) => (r.player_name ?? "").toLowerCase() === player.toLowerCase()
@@ -380,8 +585,11 @@ server.registerTool(
           !filters ||
           Object.entries(filters).every(([k, v]) => String(r[k]) === v)
       )
-      .map((r: any) => Object.fromEntries(cols.map((c) => [c, r[c]])));
-    const output = { rows };
+      .map((r: any) => {
+        const base = Object.fromEntries(cols.map((c) => [c, r[c]]));
+        return scope === "league" ? { team: r.team, ...base } : base;
+      });
+    const output = notes.length ? { rows, warnings: Array.from(new Set(notes)) } : { rows };
     return {
       content: [{ type: "text", text: JSON.stringify(output) }],
       structuredContent: output,
@@ -393,28 +601,56 @@ server.registerTool(
 server.registerTool(
   "leaderboard",
   {
-    description: "Top-N by a metric with optional qualifier",
+    description: "Top-N by a metric with optional qualifier (MLB 2025 dataset)",
     inputSchema: {
       table: z.enum(["batting", "pitching"]),
+      team: z.string().length(3).default("NYM"),
+      scope: z.enum(["team", "league"]).default("league"),
       metric: z.string(), // e.g., "OPS+", "ops_plus", "FIP", "SO/BB"
       direction: z.enum(["asc", "desc"]),
       limit: z.number().min(1).max(25),
       qualifier: z
         .object({ minPA: z.number().optional(), minIP: z.number().optional() })
         .optional(),
+      // New: optional position filter (batting only). Accepts aliases like "2B", "second base", "OF".
+      position: z.string().optional(),
     },
   },
-  async ({ table, metric, direction, limit, qualifier }) => {
-    const key = normalizeMetric(metric);
-    const dataRaw = table === "batting" ? batting : pitching;
+  async ({ table, team, scope, metric, direction, limit, qualifier, position }) => {
+    const { key, note } = normalizeMetricDetailed(metric);
+    const map = table === "batting" ? battingByTeam : pitchingByTeam;
+    const dataRaw =
+      scope === "league"
+        ? Object.values(map).flat()
+        : map[String(team).toUpperCase()] ?? [];
 
-    const data = dataRaw.filter((r: any) => {
+    const dataPre = dataRaw.filter((r: any) => {
       if (table === "batting" && qualifier?.minPA)
         return (r.pa ?? 0) >= qualifier.minPA;
       if (table === "pitching" && qualifier?.minIP)
         return (r.ip ?? 0) >= qualifier.minIP;
       return true;
     });
+
+    // Optional: filter by position for batting
+    const data =
+      table === "batting" && position
+        ? dataPre.filter((r: any) => {
+            const { targets, isUtility } = normalizePositionQuery(position);
+            const posList = extractPositions(r.pos_raw);
+            if (isUtility) {
+              const upper = String(r.pos_raw || "").toUpperCase();
+              const isUT = upper.includes("UT");
+              const infield = new Set(["1B", "2B", "3B", "SS"]);
+              const infieldCount = posList.filter((p) => infield.has(p)).length;
+              const isINFUtility = infieldCount >= 2; // rotational infielder
+              return isUT || isINFUtility;
+            }
+            if (targets.size === 0) return true;
+            if (!posList.length) return false;
+            return posList.some((p) => targets.has(p));
+          })
+        : dataPre;
 
     const sorted = data
       .filter((r: any) => r[key] != null)
@@ -429,12 +665,35 @@ server.registerTool(
       });
 
     const rows = sorted.slice(0, limit).map((r: any) => ({
+      team: r.team,
       player: r.player_name,
       [key]: r[key],
       ...(table === "batting" ? { PA: r.pa } : { IP: r.ip }),
+      ...(table === "batting" ? { pos: extractPositions(r.pos_raw).join("/") } : {}),
     }));
 
-    const output = { rows };
+    const warnings = note ? [note] : [];
+    const output = warnings.length ? { rows, warnings } : { rows };
+    return {
+      content: [{ type: "text", text: JSON.stringify(output) }],
+      structuredContent: output,
+    };
+  }
+);
+
+// Tool: teams listing
+server.registerTool(
+  "teams",
+  {
+    description: "List teams discovered under data/2025",
+    inputSchema: {},
+  },
+  async () => {
+    const uniq = new Set<string>();
+    Object.keys(battingByTeam).forEach((t) => uniq.add(t));
+    Object.keys(pitchingByTeam).forEach((t) => uniq.add(t));
+    const teams = Array.from(uniq).sort();
+    const output = { teams };
     return {
       content: [{ type: "text", text: JSON.stringify(output) }],
       structuredContent: output,
@@ -461,7 +720,7 @@ app.get("/mcp", (req, res) => {
   res.set({ "Access-Control-Allow-Origin": "*" });
   res
     .status(200)
-    .json({ ok: true, server: "mets-2025", transport: "streamable-http" });
+    .json({ ok: true, server: "mlb-2025", transport: "streamable-http" });
 });
 
 // Accept header patch before POST
